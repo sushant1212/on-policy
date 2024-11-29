@@ -176,7 +176,8 @@ def get_config():
     parser.add_argument("--num_env_steps", type=int, default=10e6,
                         help='Number of environment steps to train (default: 10e6)')
     parser.add_argument("--user_name", type=str, default='marl', help="[for wandb usage], to specify user's name for simply collecting training data.")
-    parser.add_argument("--use_wandb", action='store_false', default=True, help="[for wandb usage], by default True, will log date to wandb server. or else will use tensorboard to log data.")
+    parser.add_argument("--use_wandb", action='store_true', default=False, help="[for wandb usage], by default False, will log date to wandb server. or else will use tensorboard to log data.")
+    parser.add_argument("--use_comet", action='store_true', default=False, help="[for comet usage], by default False, will log date to comet server. or else will use tensorboard to log data.")
 
     # env parameters
     parser.add_argument("--env_name", type=str, default='StarCraft2', help="specify the name of environment")
@@ -303,5 +304,17 @@ def get_config():
     # add for online multi-task
     parser.add_argument("--train_maps", type=str, nargs='+', default=None)
     parser.add_argument("--eval_maps", type=str, nargs='+', default=None)
+
+    # comms parameters
+    parser.add_argument("--comms", action='store_true', default=False)
+    parser.add_argument("--comms_experiment", type=str, default="LimitedComms", help="multi-agent comms experiment to run - FullComms / Comms / LimitedComms.")
+    parser.add_argument("--comms_penalty", type=float, default=5e-3, help="penalty for comms.")
+    parser.add_argument("--comms_depth", type=int, default=1, help="depth of comms network.")
+    parser.add_argument("--comms_heads", type=int, default=6, help="number of heads in comms transformer network.")
+    parser.add_argument("--comms_qk_dim", type=int, default=16, help="dimension of qk in comms transformer network.")
+    parser.add_argument("--comms_v_dim", type=int, default=16, help="dimension of value in comms transformer network.")
+    parser.add_argument("--comms_mlp_dim", type=int, default=1536, help="dimension of mlp in comms transformer network.")
+    parser.add_argument("--comms_dropout", type=float, default=0.0, help="dropout in comms transformer network.")
+
     
     return parser
