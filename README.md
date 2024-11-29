@@ -73,6 +73,25 @@ echo "export SC2PATH=~/StarCraftII/" >> ~/.bashrc
 
 For SMAC v2, please refer to https://github.com/oxwhirl/smacv2.git. Make sure you have the `32x32_flat.SC2Map` map file in your `SMAC_Maps` folder.
 
+### 2.1.1 SMACv2 (MultiAgentComms)
+1. Install on-policy package:
+    ```bash
+        # install on-policy package
+        cd on-policy
+        pip install -e .
+    ```
+2. Use [this link](https://github.com/benellis3/mappo/blob/main/install_sc2.sh) to install StarCraftII on your Linux system.
+3. This would install StarCraft inside a folder called 3rdparty. Feel free to place 3rdparty wherever you want in your filesystem. 
+4. On your terminal, write the following command:
+    ```bash
+    echo "export SC2PATH=<PATH TO 3rdparty>/StarCraftII/" >> ~/.bashrc
+    ```
+5. Install SMAC as a package using the following command:
+    ```bash
+    pip install git+https://github.com/oxwhirl/smacv2.git
+    ```
+
+
 ### 2.2 Hanabi
 Environment code for Hanabi is developed from the open-source environment code, but has been slightly modified to fit the algorithms used here.  
 To install, execute the following:
