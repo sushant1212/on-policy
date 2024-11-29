@@ -15,6 +15,7 @@ class R_MAPPO():
     def __init__(self,
                  args,
                  policy,
+                 comms_network=None,
                  device=torch.device("cpu")):
 
         self.device = device
@@ -48,6 +49,16 @@ class R_MAPPO():
             self.value_normalizer = ValueNorm(1, device=self.device)
         else:
             self.value_normalizer = None
+
+        self.use_comms = args.comms
+        if self.use_comms:
+            self.comms_network = comms_network
+            assert self.comms_network is not None, "[ERROR]: Comms network must be provided if comms are enabled"
+        else:
+            self.comms_network = None
+        
+        if self.use_comms:
+            assert self.num_mini_batch == 1, "Minibatch of size greater than 1 not yet supported with comms"
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         """
@@ -101,12 +112,12 @@ class R_MAPPO():
         :return actor_grad_norm: (torch.Tensor) gradient norm from actor update.
         :return imp_weights: (torch.Tensor) importance sampling weights.
         """
-        if len(sample) == 12:
-            share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
+        if len(sample) == 13:
+            share_obs_batch, obs_batch, comms_obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
             value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, \
             adv_targ, available_actions_batch = sample
         else:
-            share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
+            share_obs_batch, obs_batch, comms_obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
             value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, \
             adv_targ, available_actions_batch, _ = sample
 
@@ -115,10 +126,14 @@ class R_MAPPO():
         value_preds_batch = check(value_preds_batch).to(**self.tpdv)
         return_batch = check(return_batch).to(**self.tpdv)
         active_masks_batch = check(active_masks_batch).to(**self.tpdv)
+        if self.use_comms:
+            assert comms_obs_batch is not None
+            assert obs_batch.shape == comms_obs_batch.shape, "obs_batch and comms_obs_batch must have the same shape"
+            comms_obs_batch = comms_obs_batch.to(**self.tpdv)
 
         # Reshape to do in a single forward pass for all steps
         values, action_log_probs, dist_entropy = self.policy.evaluate_actions(share_obs_batch,
-                                                                              obs_batch, 
+                                                                              comms_obs_batch if self.use_comms else obs_batch, 
                                                                               rnn_states_batch, 
                                                                               rnn_states_critic_batch, 
                                                                               actions_batch, 
@@ -141,16 +156,31 @@ class R_MAPPO():
         policy_loss = policy_action_loss
 
         self.policy.actor_optimizer.zero_grad()
+        if self.use_comms:
+            self.comms_network.optimizer.zero_grad()
 
         if update_actor:
-            (policy_loss - dist_entropy * self.entropy_coef).backward()
+            loss = (policy_loss - dist_entropy * self.entropy_coef)
+            if self.use_comms:
+                comms_loss, total_bits = self.comms_network.get_comms_loss()
+                loss = loss + comms_loss
+            else:
+                comms_loss = 0
+                total_bits = 0
+            loss.backward()
 
         if self._use_max_grad_norm:
             actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
+            if self.use_comms:
+                comms_grad_norm = nn.utils.clip_grad_norm_(self.comms_network.comms_net.parameters(), self.max_grad_norm)
+            else:
+                comms_grad_norm = 0
         else:
             actor_grad_norm = get_gard_norm(self.policy.actor.parameters())
 
         self.policy.actor_optimizer.step()
+        if self.use_comms:
+            self.comms_network.optimizer.step()
 
         # critic update
         value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
@@ -166,13 +196,15 @@ class R_MAPPO():
 
         self.policy.critic_optimizer.step()
 
-        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights
+        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, comms_loss, total_bits, comms_grad_norm
 
-    def train(self, buffer, update_actor=True):
+    def train(self, buffer, update_actor=True, comms_func=None):
         """
         Perform a training update using minibatch GD.
         :param buffer: (SharedReplayBuffer) buffer containing training data.
         :param update_actor: (bool) whether to update actor network.
+        :param comms_func: (function) function to perform communication between agents  
+                           that returns the communication observation.
 
         :return train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
         """
@@ -195,19 +227,31 @@ class R_MAPPO():
         train_info['actor_grad_norm'] = 0
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
+        if self.use_comms:
+            train_info['comms_loss'] = 0
+            train_info['total_bits'] = 0
+            train_info['comms_grad_norm'] = 0
 
         for _ in range(self.ppo_epoch):
+
+            comm_obs = None
+
+            # Perform communication between agents
+            if self.use_comms:
+                assert comms_func is not None, "[ERROR]: Comms function must be provided if comms are enabled"
+                comm_obs = comms_func()
+
             if self._use_recurrent_policy:
-                data_generator = buffer.recurrent_generator(advantages, self.num_mini_batch, self.data_chunk_length)
+                data_generator = buffer.recurrent_generator(advantages, self.num_mini_batch, self.data_chunk_length, comm_obs)
             elif self._use_naive_recurrent:
-                data_generator = buffer.naive_recurrent_generator(advantages, self.num_mini_batch)
+                data_generator = buffer.naive_recurrent_generator(advantages, self.num_mini_batch, comm_obs)
             else:
-                data_generator = buffer.feed_forward_generator(advantages, self.num_mini_batch)
+                data_generator = buffer.feed_forward_generator(advantages, self.num_mini_batch, comm_obs)
 
             for sample in data_generator:
 
-                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights \
-                    = self.ppo_update(sample, update_actor)
+                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, \
+                comms_loss, total_bits, comms_grad_norm = self.ppo_update(sample, update_actor)
 
                 train_info['value_loss'] += value_loss.item()
                 train_info['policy_loss'] += policy_loss.item()
@@ -215,6 +259,11 @@ class R_MAPPO():
                 train_info['actor_grad_norm'] += actor_grad_norm
                 train_info['critic_grad_norm'] += critic_grad_norm
                 train_info['ratio'] += imp_weights.mean()
+
+                if self.use_comms:
+                    train_info['comms_loss'] += comms_loss.item()
+                    train_info['total_bits'] += total_bits
+                    train_info['comms_grad_norm'] += comms_grad_norm
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
