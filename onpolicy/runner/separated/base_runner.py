@@ -9,6 +9,7 @@ from tensorboardX import SummaryWriter
 
 from onpolicy.utils.separated_buffer import SeparatedReplayBuffer
 from onpolicy.utils.util import update_linear_schedule
+from onpolicy.algorithms.utils.util import check
 
 def _t2n(x):
     return x.detach().cpu().numpy()
@@ -35,8 +36,10 @@ class Runner(object):
         self.use_linear_lr_decay = self.all_args.use_linear_lr_decay
         self.hidden_size = self.all_args.hidden_size
         self.use_wandb = self.all_args.use_wandb
+        self.use_comet = self.all_args.use_comet
         self.use_render = self.all_args.use_render
         self.recurrent_N = self.all_args.recurrent_N
+        self.use_comms = self.all_args.comms
 
         # interval
         self.save_interval = self.all_args.save_interval
@@ -56,6 +59,12 @@ class Runner(object):
         else:
             if self.use_wandb:
                 self.save_dir = str(wandb.run.dir)
+            elif self.use_comet:
+                self.run_dir = config["run_dir"]
+                self.comet_ml = config["comet_ml"]
+                self.save_dir = str(self.run_dir / 'models')
+                if not os.path.exists(self.save_dir):
+                    os.makedirs(self.save_dir)
             else:
                 self.run_dir = config["run_dir"]
                 self.log_dir = str(self.run_dir / 'logs')
@@ -77,6 +86,13 @@ class Runner(object):
             from onpolicy.algorithms.r_mappo.r_mappo import R_MAPPO as TrainAlgo
             from onpolicy.algorithms.r_mappo.algorithm.rMAPPOPolicy import R_MAPPOPolicy as Policy
 
+        if self.use_comms:
+            print(f"observation_space: {self.envs.observation_space}")
+            from onpolicy.algorithms.r_mappo.algorithm.r_comms import CommsNetwork
+            self.comms_net = CommsNetwork(self.all_args, self.envs.observation_space[0], device = self.device)
+            self.tpdv = dict(dtype=torch.float32, device=self.device)
+        else:
+            self.comms_net = None
 
         print("share_observation_space: ", self.envs.share_observation_space)
         print("observation_space: ", self.envs.observation_space)
@@ -100,7 +116,7 @@ class Runner(object):
         self.buffer = []
         for agent_id in range(self.num_agents):
             # algorithm
-            tr = TrainAlgo(self.all_args, self.policy[agent_id], device = self.device)
+            tr = TrainAlgo(self.all_args, self.policy[agent_id], comms_network=self.comms_net, device = self.device)
             # buffer
             share_observation_space = self.envs.share_observation_space[agent_id] if self.use_centralized_V else self.envs.observation_space[agent_id]
             bu = SeparatedReplayBuffer(self.all_args,
@@ -131,6 +147,44 @@ class Runner(object):
                                                                 self.buffer[agent_id].masks[-1])
             next_value = _t2n(next_value)
             self.buffer[agent_id].compute_returns(next_value, self.trainer[agent_id].value_normalizer)
+    
+    def _perform_communication(self, all_obs, masks, grad_enabled=True):
+        if not self.use_comms:
+            return all_obs
+        
+        # convert to torch tensors
+        all_obs = check(all_obs).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+
+        # reshape to (n_rollout_threads, n_agents, episode_length, obs_shape)
+        n_agents, episode_length, n_rollout_threads, _ = all_obs.shape
+        all_obs = torch.permute(all_obs, (2, 1, 0, 3))
+        masks = torch.permute(masks, (2, 1, 0, 3)).squeeze(-1).reshape(-1, n_agents)
+
+        if not grad_enabled:
+            with torch.no_grad():
+                all_obs = self.comms_net.communicate(all_obs, masks)
+        else:
+            all_obs = self.comms_net.communicate(all_obs, masks)
+        assert all_obs is not None
+        # reshape back to (n_agents, episode_length, n_rollout_threads, obs_shape)
+        all_obs = torch.permute(all_obs, (2, 1, 0, 3))
+        return all_obs
+    
+    def _generate_comms_func(self, all_obs, masks, agent_id):
+        """
+        Generates a comms function that does a forward pass through the comms network
+        and returns the communication output for the agent with the given agent_id
+
+        :param all_obs: (np.ndarray) the observations for all agents
+        :param masks: (np.ndarray) the masks for all agents
+        :param agent_id: (int) the agent id for which the communication output is required
+        """
+        def comms_func():
+            comms_obs = self._perform_communication(all_obs, masks)
+            return comms_obs[agent_id]
+        
+        return comms_func
 
     def train(self):
         train_infos = []
@@ -139,37 +193,55 @@ class Runner(object):
         action_dim=self.buffer[0].actions.shape[-1]
         factor = np.ones((self.episode_length, self.n_rollout_threads, 1), dtype=np.float32)
 
+        all_obs = np.stack([self.buffer[agent_id].obs[:-1] for agent_id in range(self.num_agents)])
+        masks = np.stack([self.buffer[agent_id].active_masks[:-1] for agent_id in range(self.num_agents)])
+
         for agent_id in torch.randperm(self.num_agents):
             self.trainer[agent_id].prep_training()
             self.buffer[agent_id].update_factor(factor)
             available_actions = None if self.buffer[agent_id].available_actions is None \
                 else self.buffer[agent_id].available_actions[:-1].reshape(-1, *self.buffer[agent_id].available_actions.shape[2:])
             
-            if self.all_args.algorithm_name == "hatrpo":
-                old_actions_logprob, _, _, _, _ =self.trainer[agent_id].policy.actor.evaluate_actions(self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
-                                                            self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
-                                                            self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
-                                                            self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
-                                                            available_actions,
-                                                            self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
-            else:
-                old_actions_logprob, _ =self.trainer[agent_id].policy.actor.evaluate_actions(self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
-                                                            self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
-                                                            self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
-                                                            self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
-                                                            available_actions,
-                                                            self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
-            train_info = self.trainer[agent_id].train(self.buffer[agent_id])
+            # pass through the comms network if communication is enabled
+            if self.use_comms:
+                comms_obs = self._perform_communication(all_obs, masks)
+                assert comms_obs is not None
+            
+            # replace the observation with the communication output in case where communication is enabled
+            obs_to_use = self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:])
+            if self.use_comms:
+                obs_to_use = comms_obs[agent_id].reshape(-1, *comms_obs[agent_id].shape[2:])
 
             if self.all_args.algorithm_name == "hatrpo":
-                new_actions_logprob, _, _, _, _ =self.trainer[agent_id].policy.actor.evaluate_actions(self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
+                old_actions_logprob, _, _, _, _ =self.trainer[agent_id].policy.actor.evaluate_actions(obs_to_use,
                                                             self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
                                                             self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
                                                             self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
                                                             available_actions,
                                                             self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
             else:
-                new_actions_logprob, _ =self.trainer[agent_id].policy.actor.evaluate_actions(self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
+                old_actions_logprob, _ =self.trainer[agent_id].policy.actor.evaluate_actions(obs_to_use,
+                                                            self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
+                                                            self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
+                                                            self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
+                                                            available_actions,
+                                                            self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
+
+            # generate the comms function if communication is enabled and pass it to the trainer
+            comms_func = None
+            if self.use_comms:
+                comms_func = self._generate_comms_func(all_obs, masks, agent_id)
+            train_info = self.trainer[agent_id].train(self.buffer[agent_id], comms_func=comms_func)
+
+            if self.all_args.algorithm_name == "hatrpo":
+                new_actions_logprob, _, _, _, _ =self.trainer[agent_id].policy.actor.evaluate_actions(obs_to_use,
+                                                            self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
+                                                            self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
+                                                            self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
+                                                            available_actions,
+                                                            self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
+            else:
+                new_actions_logprob, _ =self.trainer[agent_id].policy.actor.evaluate_actions(obs_to_use,
                                                             self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
                                                             self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
                                                             self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
@@ -191,6 +263,8 @@ class Runner(object):
             if self.trainer[agent_id]._use_valuenorm:
                 policy_vnrom = self.trainer[agent_id].value_normalizer
                 torch.save(policy_vnrom.state_dict(), str(self.save_dir) + "/vnrom_agent" + str(agent_id) + ".pt")
+            if self.use_comms:
+                torch.save(self.comms_net.comms_net.state_dict(), str(self.save_dir) + "/comms_net.pt")
 
     def restore(self):
         for agent_id in range(self.num_agents):
@@ -208,6 +282,8 @@ class Runner(object):
                 agent_k = "agent%i/" % agent_id + k
                 if self.use_wandb:
                     wandb.log({agent_k: v}, step=total_num_steps)
+                elif self.use_comet:
+                    self.comet_ml.log_metric(agent_k, v, step=total_num_steps)
                 else:
                     self.writter.add_scalars(agent_k, {agent_k: v}, total_num_steps)
 

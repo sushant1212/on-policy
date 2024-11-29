@@ -17,6 +17,7 @@ class HATRPO():
     def __init__(self,
                  args,
                  policy,
+                 comms_network=None,
                  device=torch.device("cpu")):
 
         self.device = device
@@ -322,11 +323,13 @@ class HATRPO():
 
         return value_loss, critic_grad_norm, kl, loss_improve, expected_improve, dist_entropy, ratio
 
-    def train(self, buffer, update_actor=True):
+    def train(self, buffer, update_actor=True, comms_func=None):
         """
         Perform a training update using minibatch GD.
         :param buffer: (SharedReplayBuffer) buffer containing training data.
         :param update_actor: (bool) whether to update actor network.
+        :param comms_func: (function) function to perform communication between agents  
+                           that returns the communication observation.
 
         :return train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
         """

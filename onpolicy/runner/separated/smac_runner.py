@@ -26,11 +26,15 @@ class SMACRunner(Runner):
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
 
+            episode_rewards = [0 for _ in range(self.num_agents)]
             for step in range(self.episode_length):
                 # Sample actions
                 values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
                 # Obser reward and next obs
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions)
+
+                # store reward for logging
+                episode_rewards += np.sum(rewards.squeeze(-1), axis=0)
 
                 data = obs, share_obs, rewards, dones, infos, available_actions, \
                        values, actions, action_log_probs, \
@@ -48,6 +52,10 @@ class SMACRunner(Runner):
             # save model
             if (episode % self.save_interval == 0 or episode == episodes - 1):
                 self.save()
+
+            if self.use_comet:
+                for agent_id in range(self.num_agents):
+                    self.comet_ml.log_metric(f"agent%i/" % agent_id + "Episode Reward", episode_rewards[agent_id] / self.n_rollout_threads, step=total_num_steps)
 
             # log information
             if episode % self.log_interval == 0:
@@ -80,6 +88,8 @@ class SMACRunner(Runner):
                     print("incre win rate is {}.".format(incre_win_rate))
                     if self.use_wandb:
                         wandb.log({"incre_win_rate": incre_win_rate}, step=total_num_steps)
+                    elif self.use_comet:
+                        self.comet_ml.log_metric("incre_win_rate", incre_win_rate, step=total_num_steps)
                     else:
                         self.writter.add_scalars("incre_win_rate", {"incre_win_rate": incre_win_rate}, total_num_steps)
                     
@@ -114,11 +124,24 @@ class SMACRunner(Runner):
         action_log_prob_collector=[]
         rnn_state_collector=[]
         rnn_state_critic_collector=[]
+
+        all_obs = np.stack([self.buffer[agent_id].obs[step][np.newaxis, :] for agent_id in range(self.num_agents)])
+        masks = np.stack([self.buffer[agent_id].active_masks[step][np.newaxis, :] for agent_id in range(self.num_agents)])
+
+        if self.use_comms:
+            comm_obs = self._perform_communication(all_obs, masks, grad_enabled=False).squeeze(1)
+        else:
+            comm_obs = None
+        
         for agent_id in range(self.num_agents):
             self.trainer[agent_id].prep_rollout()
+            obs_to_use = self.buffer[agent_id].obs[step]
+            if self.use_comms:
+                obs_to_use = comm_obs[agent_id]
+                assert obs_to_use.shape == self.buffer[agent_id].obs[step].shape
             value, action, action_log_prob, rnn_state, rnn_state_critic \
                 = self.trainer[agent_id].policy.get_actions(self.buffer[agent_id].share_obs[step],
-                                                self.buffer[agent_id].obs[step],
+                                                obs_to_use,
                                                 self.buffer[agent_id].rnn_states[step],
                                                 self.buffer[agent_id].rnn_states_critic[step],
                                                 self.buffer[agent_id].masks[step],
@@ -164,7 +187,7 @@ class SMACRunner(Runner):
                     active_masks[:,agent_id], available_actions[:,agent_id])
 
     @torch.no_grad()
-    def eval(self, total_num_steps):
+    def eval(self, total_num_steps):  # TODO: This needs to be updated with comms network. For later.
         eval_battles_won = 0
         eval_episode = 0
 

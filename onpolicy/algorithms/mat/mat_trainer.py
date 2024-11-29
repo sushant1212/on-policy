@@ -157,7 +157,7 @@ class MATTrainer:
 
         return value_loss, grad_norm, policy_loss, dist_entropy, grad_norm, imp_weights
 
-    def train(self, buffer):
+    def train(self, buffer, comms_obs=None):
         """
         Perform a training update using minibatch GD.
         :param buffer: (SharedReplayBuffer) buffer containing training data.

@@ -2,6 +2,7 @@
 import sys
 import os
 import wandb
+import comet_ml
 import socket
 import setproctitle
 import numpy as np
@@ -9,6 +10,9 @@ from pathlib import Path
 import torch
 from onpolicy.config import get_config
 from onpolicy.envs.env_wrappers import ShareSubprocVecEnv, ShareDummyVecEnv
+import atexit
+from os import system
+
 
 """Train script for SMAC."""
 
@@ -125,6 +129,10 @@ def parse_args(args, parser):
     return all_args
 
 
+def close():
+    system("pkill Main_Thread")
+
+
 def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
@@ -184,6 +192,11 @@ def main(args):
                          job_type="training",
                          reinit=True)
         all_args = wandb.config # for wandb sweep
+    elif all_args.use_comet:
+        experiment = comet_ml.Experiment(api_key="8U8V63x4zSaEk4vDrtwppe8Vg",
+                                         project_name="multiagentcomms")
+        experiment.set_name(all_args.experiment_name)
+        experiment.log_parameters(vars(all_args))
     else:
         if not run_dir.exists():
             curr_run = 'run1'
@@ -229,6 +242,11 @@ def main(args):
         "device": device,
         "run_dir": run_dir
     }
+
+    if all_args.use_comet:
+        config["comet_ml"] = experiment
+    
+    atexit.register(close)
 
     # run experiments
     if all_args.share_policy:
